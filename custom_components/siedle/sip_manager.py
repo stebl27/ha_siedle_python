@@ -251,6 +251,9 @@ class SipConnection:
         self._last_recv_time: float = 0.0
         self._last_register_time: float = 0.0
         self._re_register_auth_sent = False
+        # TCP/TLS receive buffer: a stream has no message boundaries, so
+        # bytes are collected here and split by Content-Length.
+        self._rx_buffer = b""
         # Time the current re-REGISTER went out; 0 while none is pending.
         self._register_pending_since: float = 0.0
         self._connection_lost = False
@@ -761,6 +764,7 @@ class SipConnection:
                 _LOGGER.debug("%s: UDP socket ready (local %s:%s)", self.name, self._local_ip, self._local_port)
 
             self._connected = True
+            self._rx_buffer = b""
             return True
 
         except Exception as e:
@@ -786,8 +790,7 @@ class SipConnection:
             _LOGGER.debug("%s: REGISTER (%d bytes):\n%s", self.name, len(register_msg), register_msg.decode()[:800])
             self._socket.send(register_msg)
 
-            response = self._socket.recv(4096)
-            msg = self.parse_message(response)
+            msg = self._recv_register_response(timeout=10)
             _LOGGER.debug("%s: Response: %s %s", self.name, msg.status_code, msg.status_text)
 
             self._extract_via_received(msg)
@@ -812,8 +815,7 @@ class SipConnection:
                     _LOGGER.debug("%s: Auth REGISTER:\n%s", self.name, auth_register.decode()[:800])
                     self._socket.send(auth_register)
 
-                    response = self._socket.recv(4096)
-                    msg = self.parse_message(response)
+                    msg = self._recv_register_response(timeout=10)
                     _LOGGER.debug("%s: Auth response: %s %s", self.name, msg.status_code, msg.status_text)
 
                     self._extract_via_received(msg)
@@ -871,14 +873,27 @@ class SipConnection:
     
     def recv(self, timeout: float = 0.1) -> Optional[SipMessage]:
         """Receive and parse message with timeout."""
+        stream = self.config.transport != SipTransport.UDP
         try:
-            if self.config.transport != SipTransport.UDP:
-                self._socket.setblocking(False)
-            self._socket.settimeout(timeout)
-            data = self._socket.recv(4096)
+            if stream:
+                # A previous read may already hold the next message.
+                data = self._take_buffered_message()
+                if data:
+                    return self.parse_message(data)
+            # Only touch the timeout when it changes. Toggling the socket to
+            # non-blocking on every call (as before) briefly turned sends from
+            # other threads into non-blocking sends, which could fail with
+            # "would block" and be taken for a dead connection.
+            if self._socket.gettimeout() != timeout:
+                self._socket.settimeout(timeout)
+            data = self._socket.recv(65535)
             if data:
                 self._last_recv_time = time.time()
-                return self.parse_message(data)
+                if not stream:
+                    return self.parse_message(data)  # one datagram = one message
+                self._rx_buffer += data
+                message = self._take_buffered_message()
+                return self.parse_message(message) if message else None
             else:
                 # Empty data = connection closed by peer
                 if self._running:
@@ -908,6 +923,51 @@ class SipConnection:
                 _LOGGER.debug(f"{self.name}: Receive error: {e}")
         return None
     
+    def _take_buffered_message(self) -> Optional[bytes]:
+        """Cut one complete SIP message off the TCP/TLS receive buffer.
+
+        recv() on a stream returns whatever bytes arrived: two messages at
+        once (e.g. a REGISTER 200 followed by a doorbell INVITE, or an INVITE
+        and its CANCEL), or part of one (an INVITE with a large SDP body).
+        Treating each read as one message lost the second message and cut
+        bodies off - including the a=crypto line of an SRTP offer.
+        """
+        buf = self._rx_buffer.lstrip(b"\r\n")  # RFC 5626 CRLF keepalives
+        self._rx_buffer = buf
+        header_end = buf.find(b"\r\n\r\n")
+        if header_end < 0:
+            if len(buf) > 65536:
+                _LOGGER.warning("%s: Dropping %d bytes without a SIP header end", self.name, len(buf))
+                self._rx_buffer = b""
+            return None
+        match = re.search(
+            rb"(?im)^(?:content-length|l)[ \t]*:[ \t]*(\d+)", buf[:header_end]
+        )
+        body_len = int(match.group(1)) if match else 0
+        total = header_end + 4 + body_len
+        if len(buf) < total:
+            return None  # body not complete yet
+        self._rx_buffer = buf[total:]
+        return buf[:total]
+
+    def _recv_register_response(self, timeout: float) -> SipMessage:
+        """Wait for the final response to our REGISTER (synchronous setup).
+
+        Skips provisional responses and anything that is not about REGISTER
+        (on TLS the server may send other traffic in between).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.recv(timeout=max(0.1, min(1.0, deadline - time.time())))
+            if self._connection_lost:
+                break
+            if not msg or not msg.status_code:
+                continue
+            cseq_method = (msg.cseq or "").split()[-1] if (msg.cseq or "").strip() else ""
+            if cseq_method == "REGISTER" and msg.status_code >= 200:
+                return msg
+        raise socket.timeout("no final response to REGISTER")
+
     def start_listen_loop(self):
         """Start background listen loop."""
         if self._listen_thread and self._listen_thread.is_alive():
