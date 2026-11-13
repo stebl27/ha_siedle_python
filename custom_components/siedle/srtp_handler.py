@@ -190,6 +190,36 @@ class SRTPCrypto:
         
         return keys
     
+    def _estimate_roc(self, ssrc: int, sequence: int) -> int:
+        """Rollover counter for this packet, RFC 3711 Appendix A.
+
+        Only estimates; _commit_roc() stores the result once the packet is
+        accepted. The old code bumped the counter whenever the sequence
+        number dropped by more than 32768 and overwrote last_seq even for late
+        packets, before the auth tag was checked: one reordered packet across
+        a wrap (0, then a late 65534, then 1) moved the counter twice, and
+        every packet after that failed authentication for the rest of the call.
+        """
+        state = self._roc_state.get(ssrc)
+        if state is None:
+            return 0
+        roc, s_l = state["roc"], state["last_seq"]
+        if s_l < 32768:
+            if sequence - s_l > 32768 and roc > 0:
+                return roc - 1          # late packet from before the wrap
+            return roc
+        if s_l - 32768 > sequence:
+            return (roc + 1) & 0xFFFFFFFF  # sequence wrapped
+        return roc
+
+    def _commit_roc(self, ssrc: int, roc: int, sequence: int) -> None:
+        """Advance the stored index if this packet is the newest seen."""
+        state = self._roc_state.get(ssrc)
+        if state is None:
+            self._roc_state[ssrc] = {"roc": roc, "last_seq": sequence}
+        elif (roc, sequence) > (state["roc"], state["last_seq"]):
+            state["roc"], state["last_seq"] = roc, sequence
+
     def _build_iv(self, session_salt: bytes, header: bytes, ssrc: int,
                   sequence: int) -> bytes:
         """Build the AES-CTR IV, including a rollover counter.
@@ -201,16 +231,13 @@ class SRTPCrypto:
         IV is bit-for-bit what this implementation produced before, which
         keeps existing peers interoperable.
         """
-        state = self._roc_state.setdefault(ssrc, {"roc": 0, "last_seq": sequence})
-        if sequence < state["last_seq"] and state["last_seq"] - sequence > 32768:
-            state["roc"] = (state["roc"] + 1) & 0xFFFFFFFF
-        state["last_seq"] = sequence
+        roc = self._estimate_roc(ssrc, sequence)
 
         iv = bytearray(16)
         iv[0:14] = session_salt          # k_s * 2^16 (bytes 14..15 stay 0 = block counter)
         for i in range(4):               # XOR SSRC * 2^64 -> bytes 4..7
             iv[4 + i] ^= header[8 + i]
-        index = (state["roc"] << 16) | sequence   # 48-bit packet index
+        index = (roc << 16) | sequence   # 48-bit packet index
         index_bytes = index.to_bytes(6, "big")
         for i in range(6):               # XOR i * 2^16 -> bytes 8..13
             iv[8 + i] ^= index_bytes[i]
@@ -261,12 +288,13 @@ class SRTPCrypto:
             # RTP port could inject audio without knowing the key.
             sequence = struct.unpack("!H", header[2:4])[0]
             iv = self._build_iv(session_salt, header, ssrc, sequence)
-            roc = self._roc_state[ssrc]["roc"]
+            roc = self._estimate_roc(ssrc, sequence)
             expected_tag = hmac.new(
                 session_auth_key, srtp_packet + struct.pack("!I", roc), hashlib.sha1
             ).digest()[:10]
             if hmac.compare_digest(expected_tag, auth_tag):
                 self._auth_verified_once = True
+                self._commit_roc(ssrc, roc, sequence)
             elif self._auth_verified_once:
                 # We know this peer's tags normally verify, so this packet is
                 # forged or corrupted.
@@ -281,6 +309,8 @@ class SRTPCrypto:
                     "SRTP: auth tag does not verify; continuing without integrity "
                     "checking until a valid tag is seen"
                 )
+            if not self._auth_verified_once:
+                self._commit_roc(ssrc, roc, sequence)
 
             # Extract encrypted payload
             encrypted_payload = srtp_packet[header_len:]
@@ -349,7 +379,8 @@ class SRTPCrypto:
             auth_portion = header + encrypted_payload
             
             # Compute HMAC-SHA1-80 authentication tag
-            roc = self._roc_state[ssrc]["roc"]
+            roc = self._estimate_roc(ssrc, sequence)
+            self._commit_roc(ssrc, roc, sequence)
             auth_tag = hmac.new(
                 session_auth_key, auth_portion + struct.pack("!I", roc), hashlib.sha1
             ).digest()[:10]
