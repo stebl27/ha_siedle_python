@@ -10,6 +10,8 @@ import ssl
 import hashlib
 import uuid
 import re
+import functools
+import select
 import threading
 import time
 from dataclasses import dataclass, field
@@ -254,6 +256,10 @@ class SipConnection:
         # TCP/TLS receive buffer: a stream has no message boundaries, so
         # bytes are collected here and split by Content-Length.
         self._rx_buffer = b""
+        # Serialises socket I/O. Listen loop, keepalive loop, timers and
+        # Home Assistant executor jobs all send on this socket; on TLS the
+        # OpenSSL object must not be read and written at the same time.
+        self._io_lock = threading.Lock()
         # Time the current re-REGISTER went out; 0 while none is pending.
         self._register_pending_since: float = 0.0
         self._connection_lost = False
@@ -788,7 +794,7 @@ class SipConnection:
             _LOGGER.debug("%s: Sending REGISTER to %s:%s (user=%s)", self.name, self.config.host, self.config.port, self.config.username)
             register_msg = self._create_register(with_auth=False)
             _LOGGER.debug("%s: REGISTER (%d bytes):\n%s", self.name, len(register_msg), register_msg.decode()[:800])
-            self._socket.send(register_msg)
+            self.send(register_msg)
 
             msg = self._recv_register_response(timeout=10)
             _LOGGER.debug("%s: Response: %s %s", self.name, msg.status_code, msg.status_text)
@@ -813,7 +819,7 @@ class SipConnection:
 
                     auth_register = self._create_register(with_auth=True)
                     _LOGGER.debug("%s: Auth REGISTER:\n%s", self.name, auth_register.decode()[:800])
-                    self._socket.send(auth_register)
+                    self.send(auth_register)
 
                     msg = self._recv_register_response(timeout=10)
                     _LOGGER.debug("%s: Auth response: %s %s", self.name, msg.status_code, msg.status_text)
@@ -850,9 +856,17 @@ class SipConnection:
             return False
     
     def send(self, data: bytes):
-        """Send data to server."""
-        if self._socket:
-            self._socket.send(data)
+        """Send data to server (thread-safe, complete writes on streams)."""
+        sock = self._socket
+        if not sock:
+            return
+        with self._io_lock:
+            if self.config.transport == SipTransport.UDP:
+                sock.send(data)
+            else:
+                # send() may write only part of the buffer on a stream; the
+                # rest was silently lost and the TCP stream desynchronised.
+                sock.sendall(data)
     
     def _discover_external_ip_via_stun(self):
         """Use STUN to discover our public IP address."""
@@ -884,9 +898,21 @@ class SipConnection:
             # non-blocking on every call (as before) briefly turned sends from
             # other threads into non-blocking sends, which could fail with
             # "would block" and be taken for a dead connection.
-            if self._socket.gettimeout() != timeout:
-                self._socket.settimeout(timeout)
-            data = self._socket.recv(65535)
+            sock = self._socket
+            if sock.gettimeout() != timeout:
+                sock.settimeout(timeout)
+            if stream:
+                # Wait for data without holding the I/O lock, so senders are
+                # never blocked behind an idle read.
+                pending = sock.pending() if hasattr(sock, "pending") else 0
+                if not pending:
+                    readable, _, _ = select.select([sock], [], [], timeout)
+                    if not readable:
+                        return None
+                with self._io_lock:
+                    data = sock.recv(65535)
+            else:
+                data = sock.recv(65535)
             if data:
                 self._last_recv_time = time.time()
                 if not stream:
@@ -1058,7 +1084,7 @@ class SipConnection:
             _LOGGER.debug(f"{self.name}: Got new nonce from REGISTER {msg.status_code}, retrying re-REGISTER...")
             try:
                 if self._socket and self._connected:
-                    self._socket.send(self._create_register(with_auth=True))
+                    self.send(self._create_register(with_auth=True))
             except Exception as e:
                 _LOGGER.warning(f"{self.name}: Re-REGISTER retry failed: {e}")
         else:
@@ -1151,7 +1177,7 @@ class SipConnection:
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
-        self._socket.send(options_msg.encode('utf-8'))
+        self.send(options_msg.encode('utf-8'))
     
     def _send_re_register(self):
         """Send a re-REGISTER to refresh registration."""
@@ -1164,7 +1190,7 @@ class SipConnection:
         self._re_register_auth_sent = False
         register_msg = self._create_register(with_auth=False)
         self._register_pending_since = time.time()
-        self._socket.send(register_msg)
+        self.send(register_msg)
         _LOGGER.debug(f"{self.name}: Re-REGISTER sent")
     
     def stop(self):
@@ -1193,6 +1219,24 @@ class SipConnection:
     def connection_lost(self) -> bool:
         """True if the connection was detected as dead."""
         return self._connection_lost
+
+
+def _call_locked(method):
+    """Run a SipCallManager method under the call-state lock.
+
+    _siedle_call, _external_call, _state and the RTP bridge are changed from
+    the Siedle and External listen threads, the forward/hangup timers, the
+    health monitor and Home Assistant executor jobs. Without a lock a CANCEL
+    racing the phone's 200 OK, or the forward timeout racing a late answer,
+    could end the call while the other path was bridging it (AttributeError
+    on a vanished call, orphaned RTP threads, two different 200 OKs to
+    Siedle). The lock is re-entrant: handlers call _end_call() themselves.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._call_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class SipCallManager:
@@ -1277,6 +1321,7 @@ class SipCallManager:
         # True while a call we placed ourselves (call_door) is in progress.
         self._door_call_outgoing = False
         self._door_call_target: Optional[str] = None
+        self._call_lock = threading.RLock()  # see _call_locked
         # hangup() on a ringing doorbell call answers it and sends BYE once
         # the ACK is in (see hangup()).
         self._hangup_after_ack = False
@@ -1398,7 +1443,8 @@ class SipCallManager:
         
         self._cancel_forward_timeout()
         
-        def _on_timeout():
+        @_call_locked
+        def _on_timeout(self=self):
             _LOGGER.warning(f"Forward timeout ({self.forward_timeout}s) — external phone didn't answer")
             
             targets = self._get_forward_targets()
@@ -1425,7 +1471,9 @@ class SipCallManager:
                 else:
                     self._end_call()
         
-        self._forward_timeout_timer = threading.Timer(self.forward_timeout, _on_timeout)
+        # _on_timeout is wrapped by _call_locked, which takes self as its
+        # first argument; the Timer must pass it.
+        self._forward_timeout_timer = threading.Timer(self.forward_timeout, _on_timeout, args=(self,))
         self._forward_timeout_timer.daemon = True
         self._forward_timeout_timer.start()
         _LOGGER.info(f"Forward timeout started: {self.forward_timeout}s")
@@ -1571,6 +1619,7 @@ class SipCallManager:
         self._handled_call_ids[call_id] = now
         return False
 
+    @_call_locked
     def _handle_siedle_message(self, msg: SipMessage):
         """Handle message from Siedle SIP server."""
         _LOGGER.debug(f"Siedle message: method={msg.method}, status={msg.status_code}, from={msg.from_header}")
@@ -1760,6 +1809,7 @@ class SipCallManager:
                     self._door_call_outgoing = False
                     self._end_call()
     
+    @_call_locked
     def _handle_external_message(self, msg: SipMessage):
         """Handle message from external SIP server."""
         if msg.is_request and msg.method == "INVITE":
@@ -2068,6 +2118,7 @@ class SipCallManager:
         # Send INVITE to first target
         self._forward_to_external_target(target)
     
+    @_call_locked
     def call_door(self, target_number: str) -> bool:
         """Call the door station without waiting for a doorbell press.
 
@@ -2587,6 +2638,7 @@ class SipCallManager:
             
             _LOGGER.info(f"=== Bridge active: Siedle ↔ {ext_rtp[0]}:{ext_rtp[1]} ===")
     
+    @_call_locked
     def _end_call(self):
         """End active call on both sides and fully clean up for next call."""
         _LOGGER.info(f"Ending call... (state={self._state}, siedle_call={'yes' if self._siedle_call else 'no'}, external_call={'yes' if self._external_call else 'no'})")
@@ -2678,6 +2730,7 @@ class SipCallManager:
         self._set_state(CallState.IDLE)
         _LOGGER.info("Call ended — state reset to IDLE, ready for next call")
     
+    @_call_locked
     def hangup(self):
         """Hangup active call (callable from HA).
 
@@ -2750,6 +2803,7 @@ class SipCallManager:
             _LOGGER.warning(f"Could not answer doorbell call to end it: {e}")
             return False
 
+    @_call_locked
     def _finish_answer_hangup(self):
         """Send the BYE for a call that hangup() answered only to end it."""
         with self._hangup_lock:
