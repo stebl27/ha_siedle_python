@@ -2715,6 +2715,7 @@ class SipCallManager:
     def _end_call(self):
         """End active call on both sides and fully clean up for next call."""
         _LOGGER.info(f"Ending call... (state={self._state}, siedle_call={'yes' if self._siedle_call else 'no'}, external_call={'yes' if self._external_call else 'no'})")
+        was_door_call = self._door_call_outgoing
         self._door_call_outgoing = False
         
         # F1: Cancel forward timeout timer
@@ -2734,6 +2735,16 @@ class SipCallManager:
                     _LOGGER.info("BYE sent to Siedle")
                 except Exception as e:
                     _LOGGER.warning(f"Failed to send BYE to Siedle: {e}")
+            elif was_door_call and self._siedle_call.state == CallState.RINGING_OUT:
+                # Our own door call, not answered yet: CANCEL the INVITE.
+                # Dropping it silently left the call pending on the Siedle
+                # server, the same way an unanswered doorbell call blocks the
+                # door station (#25).
+                try:
+                    self._siedle_conn.send(self._siedle_conn.create_cancel(self._siedle_call))
+                    _LOGGER.info("CANCEL sent to Siedle (door call not answered)")
+                except Exception as e:
+                    _LOGGER.warning(f"Failed to CANCEL door call: {e}")
             elif self._siedle_call.state in (CallState.RINGING_IN, CallState.RINGING_OUT):
                 # Call not yet answered — send CANCEL instead of BYE
                 _LOGGER.info(f"Siedle call in {self._siedle_call.state.value} — not sending BYE (not connected)")
