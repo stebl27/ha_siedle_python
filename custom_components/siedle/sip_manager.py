@@ -252,6 +252,8 @@ class SipConnection:
         self._last_recv_time: float = 0.0
         self._last_register_time: float = 0.0
         self._re_register_auth_sent = False
+        # Time the current re-REGISTER went out; 0 while none is pending.
+        self._register_pending_since: float = 0.0
         self._connection_lost = False
         # Re-register interval: 300s (well before 3600s Expires)
         self.re_register_interval: int = 300
@@ -1005,9 +1007,23 @@ class SipConnection:
                     elif cseq_method == "REGISTER":
                         if msg.status_code == 200:
                             _LOGGER.debug(f"{self.name}: Re-REGISTER successful")
+                            self._register_pending_since = 0.0
+                            self._registered = True
+                            self._apply_granted_expires(msg)
                         elif msg.status_code in (401, 407):
                             # Nonce expired — extract new nonce and retry
                             self._handle_register_auth_challenge(msg)
+                        elif msg.status_code >= 300:
+                            # A refresh the server refuses means we are no
+                            # longer reachable for INVITEs. Let the health
+                            # monitor do a full reconnect instead of carrying
+                            # on as "registered".
+                            _LOGGER.warning(
+                                "%s: Re-REGISTER rejected: %s %s - reconnecting",
+                                self.name, msg.status_code, msg.status_text,
+                            )
+                            self._registered = False
+                            self._connection_lost = True
                         else:
                             _LOGGER.debug(f"{self.name}: REGISTER response {msg.status_code}")
                         continue
@@ -1035,7 +1051,12 @@ class SipConnection:
             # Answer the challenge once per refresh. A second 401 means the
             # credentials themselves are rejected; retrying would loop.
             if self._re_register_auth_sent:
-                _LOGGER.warning(f"{self.name}: REGISTER rejected again after authentication ({msg.status_code})")
+                _LOGGER.warning(
+                    f"{self.name}: REGISTER rejected again after authentication "
+                    f"({msg.status_code}) - reconnecting"
+                )
+                self._registered = False
+                self._connection_lost = True
                 return
             self._re_register_auth_sent = True
             _LOGGER.debug(f"{self.name}: Got new nonce from REGISTER {msg.status_code}, retrying re-REGISTER...")
@@ -1047,6 +1068,29 @@ class SipConnection:
         else:
             _LOGGER.debug(f"{self.name}: REGISTER {msg.status_code} without parseable auth header")
     
+    def _apply_granted_expires(self, msg: SipMessage):
+        """Refresh at half the registration time the server granted.
+
+        We ask for 3600 s, but a registrar may grant less (Contact ;expires=
+        or an Expires header). With the fixed 300 s refresh a grant below
+        300 s let the registration lapse between refreshes.
+        """
+        granted = None
+        contact = msg.headers.get("Contact") or msg.headers.get("m") or ""
+        m = re.search(r";\s*expires\s*=\s*(\d+)", contact, re.IGNORECASE)
+        if m:
+            granted = int(m.group(1))
+        elif (msg.headers.get("Expires") or "").strip().isdigit():
+            granted = int(msg.headers["Expires"].strip())
+        if granted:
+            interval = max(30, min(300, granted // 2))
+            if interval != self.re_register_interval:
+                _LOGGER.debug(
+                    "%s: Server granted %ss - re-REGISTER every %ss",
+                    self.name, granted, interval,
+                )
+                self.re_register_interval = interval
+
     def _keepalive_loop(self):
         """Periodic keepalive and re-registration loop."""
         _LOGGER.debug("%s: Keepalive loop started (OPTIONS every %ss, re-REGISTER every %ss)", self.name, self.keepalive_interval, self.re_register_interval)
@@ -1069,6 +1113,14 @@ class SipConnection:
                     self._connection_lost = True
                     break
             
+            # A re-REGISTER that got no final answer means the registration
+            # is about to lapse unnoticed (RFC 3261 Timer F: 32 s).
+            if self._register_pending_since and (now - self._register_pending_since) > 32:
+                _LOGGER.warning(f"{self.name}: No answer to re-REGISTER after 32s - reconnecting")
+                self._registered = False
+                self._connection_lost = True
+                break
+
             # Re-register periodically
             if (now - self._last_register_time) > self.re_register_interval:
                 try:
@@ -1115,6 +1167,7 @@ class SipConnection:
         # reject it and log "Anmeldung ... nicht erfolgreich" every time.
         self._re_register_auth_sent = False
         register_msg = self._create_register(with_auth=False)
+        self._register_pending_since = time.time()
         self._socket.send(register_msg)
         _LOGGER.debug(f"{self.name}: Re-REGISTER sent")
     
