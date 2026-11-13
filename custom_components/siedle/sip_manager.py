@@ -2190,6 +2190,8 @@ class SipCallManager:
         srtp_crypto = None
         uses_srtp = False
         crypto_line = None
+        crypto_tag = "1"
+        our_crypto_line = None
         
         if self._siedle_call.invite_data:
             invite_msg = SipConnection.parse_message(self._siedle_call.invite_data)
@@ -2199,16 +2201,16 @@ class SipCallManager:
                     uses_srtp = True
                     _LOGGER.info("Siedle uses SRTP - extracting crypto parameters")
                     
-                    # Extract crypto line from SDP
-                    for line in invite_msg.body.split('\r\n'):
-                        if line.startswith('a=crypto:'):
-                            crypto_line = line[9:]  # Remove "a=crypto:" prefix
-                            _LOGGER.info(f"Found crypto line: {crypto_line[:50]}...")
-                            break
-                    
+                    from .srtp_handler import SRTPCrypto
+                    selected = SRTPCrypto.select_offer_crypto(invite_msg.body)
+                    if selected:
+                        crypto_tag, crypto_line = selected
+                        _LOGGER.info("Found crypto line: tag %s, %s", crypto_tag, crypto_line.split()[1])
+                    else:
+                        _LOGGER.error("SRTP offer has no a=crypto line with a supported suite")
+
                     if crypto_line:
                         try:
-                            from .srtp_handler import SRTPCrypto
                             srtp_crypto = SRTPCrypto.from_base64(crypto_line)
                             if srtp_crypto:
                                 _LOGGER.info("SRTP crypto initialized successfully")
@@ -2251,6 +2253,12 @@ class SipCallManager:
             # Set SRTP crypto if available
             if srtp_crypto:
                 self.rtp_bridge.set_srtp_crypto(srtp_crypto)
+                # Our own key for us -> Siedle. It used to be generated for the
+                # SDP and thrown away, so the 200 OK announced a key that no
+                # packet was ever encrypted with.
+                from .srtp_handler import SRTPCrypto
+                our_crypto_line, our_crypto = SRTPCrypto.generate_sdp_crypto_line(crypto_tag)
+                self.rtp_bridge.set_srtp_encrypt(our_crypto)
             
             # Register callback to auto-hangup when recording stops
             def on_recording_stopped():
@@ -2280,19 +2288,15 @@ class SipCallManager:
         # Build SDP response with external IP for NAT traversal
         # Like PJSIP, we advertise our public (external) IP so Siedle server can reach us
         
-        if uses_srtp and crypto_line:
+        if uses_srtp and our_crypto_line:
+            # RFC 4568: the answer carries our own key (the one set as the
+            # bridge's encrypt context above), never the offerer's.
             media_proto = "RTP/SAVP"
-            # RFC 4568: Answer MUST contain its own crypto key, NOT echo the offerer's key
-            try:
-                from .srtp_handler import SRTPCrypto
-                our_crypto_line, _ = SRTPCrypto.generate_sdp_crypto_line()
-                crypto_attr = f"a=crypto:{our_crypto_line}\r\n"
-                _LOGGER.info(f"Responding with RTP/SAVP, own SRTP key generated")
-                _LOGGER.debug(f"Our crypto line: {our_crypto_line[:50]}...")
-            except Exception as e:
-                _LOGGER.error(f"Failed to generate SRTP key, using offerer's: {e}")
-                crypto_attr = f"a=crypto:{crypto_line}\r\n"
+            crypto_attr = f"a=crypto:{our_crypto_line}\r\n"
+            _LOGGER.info("Responding with RTP/SAVP, own SRTP key")
         else:
+            if uses_srtp:
+                _LOGGER.error("SRTP offer could not be accepted - answering RTP/AVP")
             media_proto = "RTP/AVP"
             crypto_attr = ""
         
@@ -2405,20 +2409,20 @@ class SipCallManager:
                 _LOGGER.info("Siedle uses SRTP — setting up dual crypto contexts")
                 
                 # Extract Siedle's crypto key for decryption
-                for line in invite_msg.body.split('\r\n'):
-                    if line.startswith('a=crypto:'):
-                        crypto_line = line[9:]
-                        break
-                
+                from .srtp_handler import SRTPCrypto
+                selected = SRTPCrypto.select_offer_crypto(invite_msg.body)
+                crypto_tag, crypto_line = selected if selected else ("1", None)
+                if not selected:
+                    _LOGGER.error("SRTP offer has no a=crypto line with a supported suite")
+
                 if crypto_line:
                     try:
-                        from .srtp_handler import SRTPCrypto
                         srtp_decrypt = SRTPCrypto.from_base64(crypto_line)
                         if srtp_decrypt:
                             _LOGGER.info("SRTP decrypt context created (Siedle's key)")
 
-                        # Generate our own key for encryption
-                        our_crypto_line, srtp_encrypt = SRTPCrypto.generate_sdp_crypto_line()
+                        # Generate our own key for encryption (same tag as the offer)
+                        our_crypto_line, srtp_encrypt = SRTPCrypto.generate_sdp_crypto_line(crypto_tag)
                         if srtp_encrypt:
                             _LOGGER.info("SRTP encrypt context created (our key)")
                     except Exception as e:
