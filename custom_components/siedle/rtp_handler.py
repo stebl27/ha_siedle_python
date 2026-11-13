@@ -112,134 +112,71 @@ class RtpPacket:
         return header + self.payload
 
 
+def _alaw_to_linear_sample(code: int) -> int:
+    """ITU-T G.711 A-law decoding of one code (Sun g711.c alaw2linear)."""
+    code ^= 0x55
+    t = (code & 0x0F) << 4
+    seg = (code & 0x70) >> 4
+    if seg == 0:
+        t += 8
+    else:
+        t = (t + 0x108) << (seg - 1)
+    return t if code & 0x80 else -t
+
+
+def _ulaw_to_linear_sample(code: int) -> int:
+    """ITU-T G.711 mu-law decoding of one code (Sun g711.c ulaw2linear)."""
+    code = ~code & 0xFF
+    t = (((code & 0x0F) << 3) + 0x84) << ((code & 0x70) >> 4)
+    return 0x84 - t if code & 0x80 else t - 0x84
+
+
+_ALAW_SEG_END = (0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF)
+
+
+def _linear_to_alaw_sample(pcm: int) -> int:
+    """ITU-T G.711 A-law encoding of one 16-bit sample (Sun g711.c linear2alaw)."""
+    pcm >>= 3
+    if pcm >= 0:
+        mask = 0xD5
+    else:
+        mask = 0x55
+        pcm = -pcm - 1
+    seg = 0
+    while seg < 8 and pcm > _ALAW_SEG_END[seg]:
+        seg += 1
+    if seg >= 8:
+        return 0x7F ^ mask
+    aval = seg << 4
+    aval |= (pcm >> 1) & 0x0F if seg < 2 else (pcm >> seg) & 0x0F
+    return aval ^ mask
+
+
+# Lookup tables: 256 decoded values per codec, and the 16-bit sample bytes.
+# The previous implementations decoded and encoded every code wrongly
+# (A-law silence 0xD5 came out as 5504 instead of 8), which garbled
+# recordings and announcements.
+_ALAW_DECODE = [_alaw_to_linear_sample(c) for c in range(256)]
+_ULAW_DECODE = [_ulaw_to_linear_sample(c) for c in range(256)]
+_ALAW_DECODE_BYTES = [struct.pack("<h", v) for v in _ALAW_DECODE]
+_ULAW_DECODE_BYTES = [struct.pack("<h", v) for v in _ULAW_DECODE]
+
+
 def pcmu_to_linear(pcmu_data: bytes) -> bytes:
-    """Convert μ-law (PCMU) audio to 16-bit linear PCM."""
-    # μ-law decompression table
-    ULAW_TABLE = [
-        -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
-        -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
-        -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
-        -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
-        -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
-        -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
-        -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
-        -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
-        -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
-        -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
-        -876, -844, -812, -780, -748, -716, -684, -652,
-        -620, -588, -556, -524, -492, -460, -428, -396,
-        -372, -356, -340, -324, -308, -292, -276, -260,
-        -244, -228, -212, -196, -180, -164, -148, -132,
-        -120, -112, -104, -96, -88, -80, -72, -64,
-        -56, -48, -40, -32, -24, -16, -8, 0,
-        32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
-        23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
-        15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
-        11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
-        7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
-        5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
-        3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
-        2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
-        1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
-        1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
-        876, 844, 812, 780, 748, 716, 684, 652,
-        620, 588, 556, 524, 492, 460, 428, 396,
-        372, 356, 340, 324, 308, 292, 276, 260,
-        244, 228, 212, 196, 180, 164, 148, 132,
-        120, 112, 104, 96, 88, 80, 72, 64,
-        56, 48, 40, 32, 24, 16, 8, 0,
-    ]
-    
-    result = bytearray()
-    for byte in pcmu_data:
-        # Invert all bits (μ-law storage format)
-        sample = ULAW_TABLE[byte ^ 0xFF]
-        result.extend(struct.pack("<h", sample))
-    return bytes(result)
+    """Convert mu-law (PCMU) audio to 16-bit little-endian linear PCM."""
+    return b"".join(_ULAW_DECODE_BYTES[b] for b in pcmu_data)
 
 
 def pcma_to_linear(pcma_data: bytes) -> bytes:
-    """Convert A-law (PCMA) audio to 16-bit linear PCM."""
-    ALAW_TABLE = [
-        -5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736,
-        -7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784,
-        -2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368,
-        -3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392,
-        -22016, -20992, -24064, -23040, -17920, -16896, -19968, -18944,
-        -30208, -29184, -32256, -31232, -26112, -25088, -28160, -27136,
-        -11008, -10496, -12032, -11520, -8960, -8448, -9984, -9472,
-        -15104, -14592, -16128, -15616, -13056, -12544, -14080, -13568,
-        -344, -328, -376, -360, -280, -264, -312, -296,
-        -472, -456, -504, -488, -408, -392, -440, -424,
-        -88, -72, -120, -104, -24, -8, -56, -40,
-        -216, -200, -248, -232, -152, -136, -184, -168,
-        -1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184,
-        -1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696,
-        -688, -656, -752, -720, -560, -528, -624, -592,
-        -944, -912, -1008, -976, -816, -784, -880, -848,
-        5504, 5248, 6016, 5760, 4480, 4224, 4992, 4736,
-        7552, 7296, 8064, 7808, 6528, 6272, 7040, 6784,
-        2752, 2624, 3008, 2880, 2240, 2112, 2496, 2368,
-        3776, 3648, 4032, 3904, 3264, 3136, 3520, 3392,
-        22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944,
-        30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136,
-        11008, 10496, 12032, 11520, 8960, 8448, 9984, 9472,
-        15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568,
-        344, 328, 376, 360, 280, 264, 312, 296,
-        472, 456, 504, 488, 408, 392, 440, 424,
-        88, 72, 120, 104, 24, 8, 56, 40,
-        216, 200, 248, 232, 152, 136, 184, 168,
-        1376, 1312, 1504, 1440, 1120, 1056, 1248, 1184,
-        1888, 1824, 2016, 1952, 1632, 1568, 1760, 1696,
-        688, 656, 752, 720, 560, 528, 624, 592,
-        944, 912, 1008, 976, 816, 784, 880, 848,
-    ]
-    
-    result = bytearray()
-    for byte in pcma_data:
-        # A-law uses XOR with 0x55
-        sample = ALAW_TABLE[byte ^ 0x55]
-        result.extend(struct.pack("<h", sample))
-    return bytes(result)
+    """Convert A-law (PCMA) audio to 16-bit little-endian linear PCM."""
+    return b"".join(_ALAW_DECODE_BYTES[b] for b in pcma_data)
 
 
 def linear_to_pcma(pcm_data: bytes) -> bytes:
-    """Convert 16-bit linear PCM to A-law (PCMA) audio.
-    
-    Implements ITU-T G.711 A-law compression.
-    Input: 16-bit signed little-endian PCM samples.
-    Output: A-law encoded bytes.
-    """
-    result = bytearray()
-    for i in range(0, len(pcm_data), 2):
-        if i + 1 >= len(pcm_data):
-            break
-        sample = struct.unpack("<h", pcm_data[i:i+2])[0]
-        
-        # A-law compression
-        sign = 0
-        if sample < 0:
-            sign = 0x80
-            sample = -sample
-        if sample > 32767:
-            sample = 32767
-        
-        if sample >= 256:
-            exponent = 7
-            mask = 0x4000
-            while not (sample & mask) and exponent > 1:
-                exponent -= 1
-                mask >>= 1
-            mantissa = (sample >> (exponent + 3)) & 0x0F
-            alaw_byte = sign | (exponent << 4) | mantissa
-        else:
-            alaw_byte = sign | (sample >> 4)
-        
-        # A-law uses XOR with 0x55
-        result.append(alaw_byte ^ 0x55)
-    
-    return bytes(result)
-
+    """Convert 16-bit little-endian linear PCM to A-law (PCMA) audio."""
+    count = len(pcm_data) // 2
+    samples = struct.unpack("<%dh" % count, pcm_data[:count * 2])
+    return bytes(_linear_to_alaw_sample(s) for s in samples)
 
 class DtmfDetector:
     """Detects DTMF digits from RFC 4733 telephone-event RTP packets (PT=101).
