@@ -189,6 +189,104 @@ def linear_to_pcma(pcm_data: bytes) -> bytes:
     samples = struct.unpack("<%dh" % count, pcm_data[:count * 2])
     return bytes(_linear_to_alaw_sample(s) for s in samples)
 
+# ==================== Audio gain (G.711) ====================
+
+def _g711_decode_table(payload_type: int) -> list:
+    """Linear value of each of the 256 codes of PCMA (8) or PCMU (0)."""
+    return list(_ALAW_DECODE if payload_type == 8 else _ULAW_DECODE)
+
+
+# Samples above this level are compressed softly instead of clipped hard.
+_LIMITER_KNEE = 0.75 * 32767
+
+
+def _soft_limit(value: float) -> float:
+    """Pass values below the knee, approach full scale smoothly above it."""
+    import math
+    magnitude = abs(value)
+    if magnitude <= _LIMITER_KNEE:
+        return value
+    headroom = 32767 - _LIMITER_KNEE
+    limited = _LIMITER_KNEE + headroom * math.tanh((magnitude - _LIMITER_KNEE) / headroom)
+    return limited if value >= 0 else -limited
+
+
+def build_gain_table(payload_type: int, gain_db: float) -> Optional[bytes]:
+    """256-byte translate table that applies gain_db to G.711 payloads.
+
+    A table per codec and gain makes the per-packet cost a single
+    bytes.translate(). Returns None for 0 dB or a codec other than PCMA/PCMU.
+    """
+    if not gain_db or payload_type not in (0, 8):
+        return None
+    factor = 10 ** (gain_db / 20.0)
+    decoded = _g711_decode_table(payload_type)
+    # Encode by picking the code whose decoded value is closest. This is
+    # exactly the inverse of the decoder above, whatever its bit layout.
+    candidates = sorted(range(256), key=lambda c: decoded[c])
+    table = bytearray(256)
+    for code, linear in enumerate(decoded):
+        value = _soft_limit(linear * factor)
+        table[code] = min(candidates, key=lambda c: abs(decoded[c] - value))
+    return bytes(table)
+
+
+class AudioLevelMeter:
+    """Peak/RMS of the audio passing one direction of the bridge (debug log)."""
+
+    INTERVAL = 5.0
+
+    def __init__(self, name: str):
+        self.name = name
+        self._tables = {pt: _g711_decode_table(pt) for pt in (0, 8)}
+        self._reset(time.time())
+
+    def _reset(self, now: float) -> None:
+        self._peak = 0
+        self._sum_sq = 0.0
+        self._count = 0
+        self._limited = 0
+        self._since = now
+
+    def add(self, payload_type: int, payload: bytes, gain_db: float) -> None:
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        table = self._tables.get(payload_type)
+        if table is None or not payload:
+            return
+        factor = 10 ** (gain_db / 20.0)
+        for code in payload:
+            sample = abs(table[code])
+            if sample > self._peak:
+                self._peak = sample
+            self._sum_sq += sample * sample
+            if sample * factor > _LIMITER_KNEE:
+                self._limited += 1
+        self._count += len(payload)
+        now = time.time()
+        if now - self._since >= self.INTERVAL and self._count:
+            import math
+            def dbfs(v):
+                return 20 * math.log10(v / 32768) if v > 0 else -99.0
+            rms = math.sqrt(self._sum_sq / self._count)
+            _LOGGER.debug(
+                "Audio level %s: peak %.1f dBFS, rms %.1f dBFS, gain %+.0f dB, "
+                "limited %.1f%% of samples",
+                self.name, dbfs(self._peak), dbfs(rms), gain_db,
+                100.0 * self._limited / self._count,
+            )
+            self._reset(now)
+
+
+def apply_gain(rtp_data: bytes, packet: "RtpPacket", tables: dict) -> bytes:
+    """Return rtp_data with the gain table for its payload type applied."""
+    table = tables.get(packet.payload_type)
+    if not table or not packet.payload:
+        return rtp_data
+    header_len = len(rtp_data) - len(packet.payload)
+    return rtp_data[:header_len] + packet.payload.translate(table)
+
+
 class DtmfDetector:
     """Detects DTMF digits from RFC 4733 telephone-event RTP packets (PT=101).
     
@@ -615,6 +713,13 @@ class RtpBridge:
         self._srtp_decrypt: Optional[Any] = None  # Decrypt Siedle→us (Siedle's key)
         self._srtp_encrypt: Optional[Any] = None  # Encrypt us→Siedle (our key)
         self._last_b_to_a_time = 0.0  # last packet forwarded from the phone
+        # Optional gain per direction (dB) and level meters (debug log)
+        self._gain_a_to_b_db = 0.0
+        self._gain_b_to_a_db = 0.0
+        self._gain_tables_a_to_b: dict = {}
+        self._gain_tables_b_to_a: dict = {}
+        self._meter_a_to_b = AudioLevelMeter("door->phone")
+        self._meter_b_to_a = AudioLevelMeter("phone->door")
         # Legacy alias
         self._srtp_crypto: Optional[Any] = None
         
@@ -634,6 +739,20 @@ class RtpBridge:
         # Audio Player (F7)
         self._audio_player: Optional[AudioPlayer] = None
     
+    def set_gains(self, door_to_phone_db: float = 0.0, phone_to_door_db: float = 0.0) -> None:
+        """Set the gain for each direction in dB (0 = unchanged)."""
+        self._gain_a_to_b_db = float(door_to_phone_db or 0)
+        self._gain_b_to_a_db = float(phone_to_door_db or 0)
+        self._gain_tables_a_to_b = {
+            pt: t for pt in (0, 8) if (t := build_gain_table(pt, self._gain_a_to_b_db))
+        }
+        self._gain_tables_b_to_a = {
+            pt: t for pt in (0, 8) if (t := build_gain_table(pt, self._gain_b_to_a_db))
+        }
+        if self._gain_a_to_b_db or self._gain_b_to_a_db:
+            _LOGGER.info("Audio gain: door->phone %+.0f dB, phone->door %+.0f dB",
+                         self._gain_a_to_b_db, self._gain_b_to_a_db)
+
     def stun_discover_external_port(self) -> Tuple[Optional[str], Optional[int]]:
         """Discover external IP and port via STUN using the actual RTP socket.
         
@@ -1096,6 +1215,9 @@ class RtpBridge:
                         
                         # Forward to B if configured
                         if self._remote_b and self._socket_b:
+                            self._meter_a_to_b.add(packet.payload_type, packet.payload,
+                                                   self._gain_a_to_b_db)
+                            rtp_data = apply_gain(rtp_data, packet, self._gain_tables_a_to_b)
                             # Send decrypted RTP (not SRTP)
                             self._socket_b.sendto(rtp_data, self._remote_b)
                         
@@ -1166,6 +1288,9 @@ class RtpBridge:
 
                         # Forward to A (Siedle)
                         if self._remote_a and self._socket_a:
+                            self._meter_b_to_a.add(packet.payload_type, packet.payload,
+                                                   self._gain_b_to_a_db)
+                            data = apply_gain(data, packet, self._gain_tables_b_to_a)
                             if self._srtp_encrypt:
                                 # Encrypt plain RTP to SRTP before sending to Siedle
                                 encrypted = self._srtp_encrypt.encrypt_rtp(data)
