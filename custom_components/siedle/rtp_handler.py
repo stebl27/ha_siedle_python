@@ -675,6 +675,7 @@ class RtpBridge:
         # SRTP Support — dual context for bridge mode
         self._srtp_decrypt: Optional[Any] = None  # Decrypt Siedle→us (Siedle's key)
         self._srtp_encrypt: Optional[Any] = None  # Encrypt us→Siedle (our key)
+        self._last_b_to_a_time = 0.0  # last packet forwarded from the phone
         # Legacy alias
         self._srtp_crypto: Optional[Any] = None
         
@@ -1021,15 +1022,27 @@ class RtpBridge:
                 )
                 # Add 160 bytes of silence (A-law silence = 0xD5)
                 silence = bytes([0xD5] * 160)
-                packet = rtp_header + silence
-                
-                self._socket_a.sendto(packet, remote)
+                packet = self._protect_for_a(rtp_header + silence)
+                if packet:
+                    self._socket_a.sendto(packet, remote)
                 time.sleep(0.02)  # 20ms between packets
             
             _LOGGER.info(f"NAT punch-through sent: {count} packets to {remote[0]}:{remote[1]}")
         except Exception as e:
             _LOGGER.error(f"NAT punch-through error: {e}")
     
+    def _protect_for_a(self, packet: bytes) -> Optional[bytes]:
+        """Encrypt a packet for Siedle when the call uses SRTP.
+
+        NAT punch and keepalive packets used to go out as plain RTP even on
+        RTP/SAVP calls. The far end drops those (SRTP authentication fails
+        before any address latching), so it never learnt where to send its
+        media: "No RTP packets received ... call established but no audio".
+        """
+        if self._srtp_encrypt:
+            return self._srtp_encrypt.encrypt_rtp(packet)
+        return packet
+
     def _send_keepalive(self):
         """Send continuous RTP silence to Siedle to keep NAT pinhole open.
         
@@ -1058,11 +1071,11 @@ class RtpBridge:
                     ssrc,
                 )
                 silence = bytes([0xD5] * 160)  # A-law silence, 20ms at 8kHz
-                packet = rtp_header + silence
-                if self._srtp_encrypt:
-                    packet = self._srtp_encrypt.encrypt_rtp(packet)
-                
-                if packet:
+                packet = self._protect_for_a(rtp_header + silence)
+
+                # While the phone's audio is being forwarded to Siedle, a second
+                # stream with its own SSRC would only confuse the far end.
+                if packet and time.time() - self._last_b_to_a_time > 0.5:
                     self._socket_a.sendto(packet, self._remote_a)
                 
                 seq += 1
@@ -1193,6 +1206,7 @@ class RtpBridge:
                     packet = RtpPacket.parse(data)
                     if packet:
                         self._packets_b_to_a += 1
+                        self._last_b_to_a_time = time.time()
                         packet_count += 1
                         
                         if packet_count <= 3:
