@@ -831,36 +831,37 @@ class Siedle:
         # Enable paho auto-reconnect for post-connect drops (1s–30s backoff)
         self._mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
 
-        for attempt in range(3):
-            try:
-                self._mqtt_client.connect(
-                    mqtt_config['host'],
-                    mqtt_config['port'],
-                    keepalive=60,
-                )
-                self._mqtt_client.loop_start()
+        # connect_async + loop_start: paho's network thread runs
+        # loop_forever(retry_first_connection=True), so it keeps retrying with
+        # the backoff above until the broker answers. The old synchronous
+        # connect() gave up after three tries and left a client behind whose
+        # loop was stopped: MQTT then stayed down until the entry was reloaded
+        # (e.g. when HA boots before DNS/Internet is up).
+        try:
+            self._mqtt_client.connect_async(
+                mqtt_config['host'],
+                mqtt_config['port'],
+                keepalive=60,
+            )
+            self._mqtt_client.loop_start()
+        except Exception as e:
+            _LOGGER.error("MQTT client could not be started: %s", e)
+            self._mqtt_client = None
+            self._mqtt_connected = False
+            return False
 
-                # Wait up to 10s for on_connect callback
-                deadline = time.time() + 10
-                while not self._mqtt_connected and time.time() < deadline:
-                    time.sleep(0.1)
+        # Wait a little for the first connection so setup can report it.
+        deadline = time.time() + 15
+        while not self._mqtt_connected and time.time() < deadline:
+            time.sleep(0.1)
 
-                if self._mqtt_connected:
-                    _LOGGER.info("MQTT connection established")
-                    return True
+        if self._mqtt_connected:
+            _LOGGER.info("MQTT connection established")
+            return True
 
-                _LOGGER.warning("MQTT connection attempt %d/3 timed out", attempt + 1)
-                self._mqtt_client.loop_stop()
-                self._mqtt_connected = False
-
-            except Exception as e:
-                _LOGGER.warning("MQTT connect attempt %d/3 failed: %s", attempt + 1, e)
-
-            if attempt < 2:
-                delay = 2 ** attempt  # 1s, 2s
-                time.sleep(delay)
-
-        _LOGGER.error("MQTT connection failed after 3 attempts")
+        _LOGGER.warning(
+            "MQTT not connected yet - retrying in the background"
+        )
         return False
     
     def disconnect_mqtt(self):
