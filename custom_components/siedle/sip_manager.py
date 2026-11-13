@@ -1276,6 +1276,7 @@ class SipCallManager:
         self._handled_call_ids: Dict[str, float] = {}
         # True while a call we placed ourselves (call_door) is in progress.
         self._door_call_outgoing = False
+        self._door_call_target: Optional[str] = None
         # hangup() on a ringing doorbell call answers it and sends BYE once
         # the ACK is in (see hangup()).
         self._hangup_after_ack = False
@@ -1719,13 +1720,40 @@ class SipCallManager:
                 _LOGGER.info("Siedle: response to our BYE: %s %s", msg.status_code, msg.status_text)
 
             # Responses to a door call we placed ourselves (call_door service).
-            if self._door_call_outgoing and self._siedle_call:
+            # Only INVITE responses count: a 200 to our BYE is not "answered".
+            if (self._door_call_outgoing and self._siedle_call
+                    and "INVITE" in (msg.cseq or "")):
+                call = self._siedle_call
                 if msg.status_code in (180, 183):
                     _LOGGER.info("Door call: ringing")
                 elif msg.status_code == 200:
-                    _LOGGER.info("Door call: 200 OK — door station answered")
-                    self._handle_door_call_answered(msg)
-                elif msg.status_code and msg.status_code >= 400:
+                    if call.state == CallState.CONNECTED:
+                        # Retransmitted 200 OK: our ACK got lost. ACK again,
+                        # but do not set the call up a second time.
+                        self._siedle_conn.send(self._siedle_conn.create_ack(call, msg))
+                    else:
+                        _LOGGER.info("Door call: 200 OK — door station answered")
+                        self._handle_door_call_answered(msg)
+                elif msg.status_code and msg.status_code >= 300:
+                    # Final non-2xx: ACK it (RFC 3261 17.1.1.3), then answer
+                    # a digest challenge once, as for the external INVITE.
+                    self._siedle_conn.send(self._siedle_conn.create_ack(call, msg))
+                    if msg.status_code in (401, 407) and not call.auth_attempted:
+                        is_proxy = msg.status_code == 407
+                        auth_value = (
+                            msg.headers.get("Proxy-Authenticate" if is_proxy else "WWW-Authenticate")
+                            or msg.headers.get("WWW-Authenticate")
+                            or msg.headers.get("Proxy-Authenticate", "")
+                        )
+                        realm_match = re.search(r'realm="([^"]+)"', auth_value)
+                        nonce_match = re.search(r'nonce="([^"]+)"', auth_value)
+                        if realm_match and nonce_match:
+                            self._siedle_conn._realm = realm_match.group(1)
+                            self._siedle_conn._nonce = nonce_match.group(1)
+                            _LOGGER.info("Door call: %s - retrying with credentials", msg.status_code)
+                            self._send_door_invite(self._door_call_target, retry_of=call,
+                                                   proxy_auth=is_proxy)
+                            return
                     _LOGGER.warning(
                         "Door call rejected: %s %s", msg.status_code, msg.status_text
                     )
@@ -1956,7 +1984,7 @@ class SipCallManager:
         response = conn.create_response(request, 200, "OK")
         conn.send(response)
     
-    def _forward_to_external(self):
+    def _forward_to_external(self, reuse_bridge: bool = False):
         """Forward incoming Siedle call to external SIP server (B2BUA late-answer).
         
         Flow:
@@ -1994,13 +2022,23 @@ class SipCallManager:
             self._siedle_call.remote_rtp_host,
             self._siedle_call.remote_rtp_port
         )
-        local_rtp_port_a, local_rtp_port_b = self.rtp_bridge.setup(
-            remote_a=remote_siedle,
-            remote_b=None  # Not known until external 200 OK
-        )
+        if reuse_bridge:
+            # Door call: the sockets exist and socket A is in use already.
+            local_rtp_port_a = self.rtp_bridge.local_port_a
+            local_rtp_port_b = self.rtp_bridge.local_port_b
+        else:
+            local_rtp_port_a, local_rtp_port_b = self.rtp_bridge.setup(
+                remote_a=remote_siedle,
+                remote_b=None  # Not known until external 200 OK
+            )
         
         # Step 2: STUN on socket_a to discover Siedle-facing external port
-        stun_ip_a, stun_port_a = self.rtp_bridge.stun_discover_external_port()
+        if reuse_bridge:
+            # STUN on a socket that is already receiving media would race the
+            # RTP thread for the reply; the door call does not need it.
+            stun_ip_a, stun_port_a = None, None
+        else:
+            stun_ip_a, stun_port_a = self.rtp_bridge.stun_discover_external_port()
         if stun_port_a:
             _LOGGER.info(f"STUN (Siedle): external {stun_ip_a}:{stun_port_a} for local port {local_rtp_port_a}")
         
@@ -2047,7 +2085,19 @@ class SipCallManager:
         if not target_number:
             raise RuntimeError("No door call number known")
 
-        local_port_a, local_port_b = self.rtp_bridge.setup(None, None)
+        self.rtp_bridge.setup(None, None)
+        self._door_call_target = target_number
+        self._door_call_outgoing = True
+        self._cached_local_rtp_port_b = self.rtp_bridge.local_port_b
+        self._send_door_invite(target_number)
+
+        self._set_state(CallState.RINGING_OUT, {"target": target_number, "door_call": True})
+        return True
+
+    def _send_door_invite(self, target_number: str, retry_of: Optional[SipCall] = None,
+                          proxy_auth: bool = False) -> None:
+        """Send the door-call INVITE; with retry_of it answers a 401/407."""
+        local_port_a = self.rtp_bridge.local_port_a
         sdp_ip = self._siedle_conn._get_local_ip()
         session_id = str(int(time.time()))
         sdp = (
@@ -2066,17 +2116,29 @@ class SipCallManager:
         )
 
         to_uri = f"sip:{target_number}@{self._siedle_conn.config.host}"
+        retry_args = {}
+        if retry_of:
+            conn = self._siedle_conn
+            retry_args = {
+                "call_id": retry_of.call_id,
+                "from_tag": retry_of.from_tag,
+                "cseq": retry_of.invite_cseq + 1,
+                "auth_header": (
+                    f'{"Proxy-Authorization" if proxy_auth else "Authorization"}: '
+                    f'Digest username="{conn.config.username}", '
+                    f'realm="{conn._realm}", '
+                    f'nonce="{conn._nonce}", '
+                    f'uri="{to_uri}", '
+                    f'response="{conn._compute_digest("INVITE", to_uri)}", '
+                    f'algorithm=MD5'
+                ),
+            }
         invite_msg, call = self._siedle_conn.create_invite(
-            to_uri, local_port_a, sdp_override=sdp
+            to_uri, local_port_a, sdp_override=sdp, **retry_args
         )
         self._siedle_call = call
-        self._door_call_outgoing = True
-        self._cached_local_rtp_port_b = local_port_b
         self._siedle_conn.send(invite_msg)
-
-        self._set_state(CallState.RINGING_OUT, {"target": target_number, "door_call": True})
         _LOGGER.info("Door call INVITE sent to %s (RTP %s:%s)", to_uri, sdp_ip, local_port_a)
-        return True
 
     def _handle_door_call_answered(self, msg: SipMessage) -> None:
         """The door station accepted our outgoing call."""
@@ -2107,9 +2169,11 @@ class SipCallManager:
         self._set_state(CallState.CONNECTED, {"door_call": True})
 
         # Ring the configured phone so someone can actually talk to the door.
+        # Keep the sockets: the door station already sends to socket A, whose
+        # port went out in our INVITE. A fresh setup() would close it.
         if (self.forward_to_number and self._external_conn
                 and self._external_conn.registered):
-            self._forward_to_external()
+            self._forward_to_external(reuse_bridge=True)
 
     def _forward_to_external_target(self, target_number: str):
         """Send INVITE to a specific external target (supports F2 sequential forwarding)."""
