@@ -1324,6 +1324,8 @@ class SipCallManager:
         # True while a call we placed ourselves (call_door) is in progress.
         self._door_call_outgoing = False
         self._door_call_target: Optional[str] = None
+        self._door_sdp: Optional[str] = None
+        self._door_media_ready = False
         self._call_lock = threading.RLock()  # see _call_locked
         # hangup() on a ringing doorbell call answers it and sends BYE once
         # the ACK is in (see hangup()).
@@ -1788,8 +1790,12 @@ class SipCallManager:
             if (self._door_call_outgoing and self._siedle_call
                     and "INVITE" in (msg.cseq or "")):
                 call = self._siedle_call
+                _LOGGER.debug("Door call response:\n%s", msg.raw[:3000])
                 if msg.status_code in (180, 183):
-                    _LOGGER.info("Door call: ringing")
+                    _LOGGER.info("Door call: %s %s%s", msg.status_code, msg.status_text,
+                                 " (with SDP)" if msg.body else "")
+                    if msg.body:
+                        self._setup_door_media(msg)  # early media
                 elif msg.status_code == 200:
                     if call.state == CallState.CONNECTED:
                         # Retransmitted 200 OK: our ACK got lost. ACK again,
@@ -2200,7 +2206,36 @@ class SipCallManager:
         self.rtp_bridge.setup(None, None)
         self._door_call_target = target_number
         self._door_call_outgoing = True
+        self._door_media_ready = False
         self._cached_local_rtp_port_b = self.rtp_bridge.local_port_b
+
+        # Offer media the way the doorbell answer does: SRTP (Siedle's own
+        # INVITEs always offer RTP/SAVP) and the NAT-mapped public address of
+        # socket A. The old offer was plain RTP/AVP with HA's private LAN IP,
+        # which the Siedle cloud can neither accept nor reach.
+        from .srtp_handler import SRTPCrypto
+        stun_ip, stun_port = self.rtp_bridge.stun_discover_external_port()
+        sdp_ip = stun_ip or self._siedle_conn.get_sdp_ip()
+        sdp_port = stun_port or self.rtp_bridge.local_port_a
+        crypto_line, encrypt_ctx = SRTPCrypto.generate_sdp_crypto_line("1")
+        self.rtp_bridge.set_srtp_encrypt(encrypt_ctx)
+        session_id = str(int(time.time()))
+        self._door_sdp = (
+            f"v=0\r\n"
+            f"o=- {session_id} {session_id} IN IP4 {sdp_ip}\r\n"
+            f"s=Siedle Door Call\r\n"
+            f"c=IN IP4 {sdp_ip}\r\n"
+            f"t=0 0\r\n"
+            f"m=audio {sdp_port} RTP/SAVP 8 101\r\n"
+            f"a=rtpmap:8 PCMA/8000\r\n"
+            f"a=rtpmap:101 telephone-event/8000\r\n"
+            f"a=fmtp:101 0-16\r\n"
+            f"a=ptime:20\r\n"
+            f"a=crypto:{crypto_line}\r\n"
+            f"a=sendrecv\r\n"
+        )
+        _LOGGER.info("Door call: offering SRTP on %s:%s (local port %s)",
+                     sdp_ip, sdp_port, self.rtp_bridge.local_port_a)
         self._send_door_invite(target_number)
 
         self._set_state(CallState.RINGING_OUT, {"target": target_number, "door_call": True})
@@ -2210,22 +2245,7 @@ class SipCallManager:
                           proxy_auth: bool = False) -> None:
         """Send the door-call INVITE; with retry_of it answers a 401/407."""
         local_port_a = self.rtp_bridge.local_port_a
-        sdp_ip = self._siedle_conn._get_local_ip()
-        session_id = str(int(time.time()))
-        sdp = (
-            f"v=0\r\n"
-            f"o=- {session_id} {session_id} IN IP4 {sdp_ip}\r\n"
-            f"s=Siedle Door Call\r\n"
-            f"c=IN IP4 {sdp_ip}\r\n"
-            f"t=0 0\r\n"
-            f"m=audio {local_port_a} RTP/AVP 8 0 101\r\n"
-            f"a=rtpmap:8 PCMA/8000\r\n"
-            f"a=rtpmap:0 PCMU/8000\r\n"
-            f"a=rtpmap:101 telephone-event/8000\r\n"
-            f"a=fmtp:101 0-16\r\n"
-            f"a=ptime:20\r\n"
-            f"a=sendrecv\r\n"
-        )
+        sdp = self._door_sdp  # same offer on the authenticated retry
 
         to_uri = f"sip:{target_number}@{self._siedle_conn.config.host}"
         retry_args = {}
@@ -2250,7 +2270,49 @@ class SipCallManager:
         )
         self._siedle_call = call
         self._siedle_conn.send(invite_msg)
-        _LOGGER.info("Door call INVITE sent to %s (RTP %s:%s)", to_uri, sdp_ip, local_port_a)
+        _LOGGER.info("Door call INVITE sent to %s (local RTP port %s)", to_uri, local_port_a)
+
+    def _setup_door_media(self, msg: SipMessage) -> None:
+        """Start door audio from the SDP of a 183 (early media) or 200 OK.
+
+        Rings the forwarding target once, as soon as the door's media is
+        known: Siedle may stream the door station as early media without
+        ever answering with 200 OK.
+        """
+        call = self._siedle_call
+        if not call or not msg.body or "m=audio" not in msg.body:
+            return
+        host = msg.get_sdp_connection_ip()
+        port = msg.get_sdp_media_port() or 0
+        if not host or not port:
+            return
+        call.remote_rtp_host, call.remote_rtp_port = host, port
+        self.rtp_bridge.set_remote_a((host, port))
+
+        from .srtp_handler import SRTPCrypto
+        selected = SRTPCrypto.select_offer_crypto(msg.body)
+        if selected:
+            decrypt_ctx = SRTPCrypto.from_base64(selected[1])
+            if decrypt_ctx:
+                self.rtp_bridge.set_srtp_decrypt(decrypt_ctx)
+        elif "RTP/SAVP" not in msg.body:
+            # Plain RTP answer: do not encrypt towards the door.
+            self.rtp_bridge.set_srtp_encrypt(None)
+
+        if not self.rtp_bridge._running:
+            self.rtp_bridge.start()
+        _LOGGER.info("Door call media: %s:%s (%s)", host, port,
+                     "SRTP" if selected else "RTP")
+
+        if self._door_media_ready:
+            return
+        self._door_media_ready = True
+        # Ring the configured phone so someone can actually talk to the door.
+        # Keep the sockets: the door station already sends to socket A, whose
+        # port went out in our INVITE. A fresh setup() would close it.
+        if (self.forward_to_number and self._external_conn
+                and self._external_conn.registered):
+            self._forward_to_external(reuse_bridge=True)
 
     def _handle_door_call_answered(self, msg: SipMessage) -> None:
         """The door station accepted our outgoing call."""
@@ -2260,8 +2322,6 @@ class SipCallManager:
 
         call.to_tag = self._extract_tag(msg.to_header)
         call.state = CallState.CONNECTED
-        call.remote_rtp_port = msg.get_sdp_media_port() or 0
-        call.remote_rtp_host = msg.get_sdp_connection_ip()
 
         try:
             ack = self._siedle_conn.create_ack(call, msg)
@@ -2270,22 +2330,8 @@ class SipCallManager:
             _LOGGER.error("Door call: failed to ACK 200 OK: %s", e)
             return
 
-        if call.remote_rtp_host and call.remote_rtp_port:
-            self.rtp_bridge.set_remote_a((call.remote_rtp_host, call.remote_rtp_port))
-            if not self.rtp_bridge._running:
-                self.rtp_bridge.start()
-            _LOGGER.info(
-                "Door call connected, RTP %s:%s", call.remote_rtp_host, call.remote_rtp_port
-            )
-
         self._set_state(CallState.CONNECTED, {"door_call": True})
-
-        # Ring the configured phone so someone can actually talk to the door.
-        # Keep the sockets: the door station already sends to socket A, whose
-        # port went out in our INVITE. A fresh setup() would close it.
-        if (self.forward_to_number and self._external_conn
-                and self._external_conn.registered):
-            self._forward_to_external(reuse_bridge=True)
+        self._setup_door_media(msg)
 
     def _forward_to_external_target(self, target_number: str):
         """Send INVITE to a specific external target (supports F2 sequential forwarding)."""
