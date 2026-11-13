@@ -148,6 +148,9 @@ class SipCall:
     # went out for the INVITE, so it is never answered twice.
     incoming: bool = False
     final_response_sent: bool = False
+    # SDP of our 200 OK, re-sent when the peer refreshes the session with a
+    # re-INVITE.
+    local_sdp: Optional[str] = None
 
     def next_cseq(self) -> int:
         """Get and increment CSeq."""
@@ -1633,7 +1636,16 @@ class SipCallManager:
         """Handle message from Siedle SIP server."""
         _LOGGER.debug(f"Siedle message: method={msg.method}, status={msg.status_code}, from={msg.from_header}")
         
-        if msg.is_request and msg.method == "INVITE":
+        if (msg.is_request and msg.method == "INVITE"
+                and ";tag=" in (msg.to_header or "")):
+            # A To tag means an in-dialog re-INVITE (session refresh, hold,
+            # media change), not a doorbell press. It used to get only
+            # "100 Trying" (inside the 60 s duplicate window, so Siedle tore
+            # the call down after its timeout) or, later, was taken for a new
+            # ring that ended the running call.
+            self._handle_siedle_reinvite(msg)
+
+        elif msg.is_request and msg.method == "INVITE":
             _LOGGER.warning("SIEDLE INVITE - DOORBELL! From: %s", msg.from_header)
 
             # A repeat of an INVITE we already handled is a retransmission or a
@@ -1782,6 +1794,9 @@ class SipCallManager:
             if self._hangup_after_ack:
                 self._finish_answer_hangup()
 
+        elif msg.is_request:
+            self._answer_other_request(self._siedle_conn, msg)
+
         elif not msg.is_request:
             # Log all SIP responses (100, 180, 183, etc.)
             _LOGGER.debug(f"Siedle: SIP response {msg.status_code} {msg.status_text}")
@@ -1879,6 +1894,9 @@ class SipCallManager:
             # Propagate: also hang up Siedle side
             _LOGGER.info("Propagating hangup to Siedle side...")
             self._end_call()
+
+        elif msg.is_request and msg.method != "ACK":
+            self._answer_other_request(self._external_conn, msg)
     
     def _handle_external_response(self, msg: SipMessage):
         """Handle a response from the external SIP server.
@@ -2050,6 +2068,49 @@ class SipCallManager:
         match = re.search(r'tag=([^;>\s]+)', header)
         return match.group(1) if match else None
     
+    # Requests we accept without acting on them. Everything else unknown
+    # gets 501, so the sender is not left waiting for a timeout.
+    _ACCEPTED_REQUESTS = ("OPTIONS", "UPDATE", "INFO", "NOTIFY", "PRACK", "MESSAGE", "CANCEL")
+
+    def _answer_other_request(self, conn: SipConnection, msg: SipMessage):
+        """Answer requests the call logic does not handle.
+
+        OPTIONS, UPDATE, NOTIFY etc. used to get no answer at all. A proxy
+        pinging a registered contact with OPTIONS may then mark it
+        unreachable, and an unanswered UPDATE (session refresh) makes the
+        far end tear the call down after 32 s.
+        """
+        try:
+            if msg.method in self._ACCEPTED_REQUESTS:
+                response = conn.create_response(msg, 200, "OK")
+            else:
+                response = conn.create_response(msg, 501, "Not Implemented")
+            conn.send(response)
+            _LOGGER.debug("%s: answered %s", conn.name, msg.method)
+        except Exception as e:
+            _LOGGER.debug("%s: could not answer %s: %s", conn.name, msg.method, e)
+
+    def _handle_siedle_reinvite(self, msg: SipMessage):
+        """Answer an in-dialog re-INVITE with the SDP of our 200 OK."""
+        call = self._siedle_call
+        try:
+            if call and call.call_id == msg.call_id and call.local_sdp:
+                if msg.body and "a=crypto:" in msg.body:
+                    _LOGGER.info("Siedle re-INVITE offers new SRTP keys - keeping the current ones")
+                _LOGGER.info("Siedle: re-INVITE for the active call - answering with our SDP")
+                response = self._siedle_conn.create_response(
+                    msg, 200, "OK", call.local_sdp, call.local_rtp_port
+                )
+            elif call and call.call_id == msg.call_id:
+                response = self._siedle_conn.create_response(msg, 491, "Request Pending")
+            else:
+                response = self._siedle_conn.create_response(
+                    msg, 481, "Call/Transaction Does Not Exist"
+                )
+            self._siedle_conn.send(response)
+        except Exception as e:
+            _LOGGER.warning("Could not answer Siedle re-INVITE: %s", e)
+
     def _send_ok_response(self, conn: SipConnection, request: SipMessage):
         """Send 200 OK response."""
         response = conn.create_response(request, 200, "OK")
@@ -2462,6 +2523,7 @@ class SipCallManager:
         if self._siedle_call.invite_data:
             original = SipConnection.parse_message(self._siedle_call.invite_data)
             response = self._siedle_conn.create_response(original, 200, "OK", sdp, local_rtp_port)
+            self._siedle_call.local_sdp = sdp
             
             # Log the full raw 200 OK for diagnostics
             _LOGGER.debug(f"Raw 200 OK:\n{response.decode('utf-8', errors='replace')}")
@@ -2635,6 +2697,7 @@ class SipCallManager:
         # --- Send 200 OK to Siedle ---
         if self._siedle_call.invite_data:
             original = SipConnection.parse_message(self._siedle_call.invite_data)
+            self._siedle_call.local_sdp = sdp
             response = self._siedle_conn.create_response(original, 200, "OK", sdp,
                                                           self.rtp_bridge.local_port_a)
             self._siedle_conn.send(response)
