@@ -114,7 +114,7 @@ class Siedle:
                     # force token refresh
                     self._token["expires_at"] = time.time() - 10
                     self._token["expires_in"] = "-30"
-                    self.refreshToken()
+                    self.refreshToken(force_expire=True)
             else:
                 self.authorize(setupInfo)
 
@@ -300,8 +300,13 @@ class Siedle:
         self._load_config()
         self._load_contacts()
     
-    def refreshToken(self):
+    def refreshToken(self, force_expire: bool = False):
         """Rebuild the OAuth session so the next request refreshes the token.
+
+        force_expire marks the current access token as expired first. Without
+        it a rebuilt session keeps using a token whose expires_at still lies in
+        the future, so after a 401 (token revoked or invalidated early) the
+        retry sent the same rejected token again.
 
         Serialized and rate limited: the coordinator polls every few minutes
         and button presses share this instance, so an expired token used to
@@ -320,6 +325,11 @@ class Siedle:
                 _LOGGER.debug("Skipping token refresh, one just happened")
                 return
             self._last_refresh = now
+
+            if force_expire and self._token:
+                self._token = dict(self._token)
+                self._token["expires_at"] = now - 10
+                self._token["expires_in"] = "-30"
 
             self._client = OAuth2Session(
                 self._client_id,
@@ -425,7 +435,7 @@ class Siedle:
             _LOGGER.error("HTTP Error Siedle API: %s", e)
             if e.response is not None and e.response.status_code == 401:
                 try:
-                    self.refreshToken()
+                    self.refreshToken(force_expire=True)
                     response = self._client.get(url, timeout=30)
                     response.raise_for_status()
                     return response.json()
@@ -458,7 +468,7 @@ class Siedle:
             _LOGGER.error("HTTP Error Siedle API: %s", e)
             if e.response is not None and e.response.status_code == 401:
                 try:
-                    self.refreshToken()
+                    self.refreshToken(force_expire=True)
                     _LOGGER.debug("Retrying POST with refreshed token")
                     response = self._client.post(url, json=data, timeout=30)
                     response.raise_for_status()
@@ -492,7 +502,7 @@ class Siedle:
             _LOGGER.error("HTTP Error Siedle API: %s", e)
             if e.response is not None and e.response.status_code == 401:
                 try:
-                    self.refreshToken()
+                    self.refreshToken(force_expire=True)
                     response = self._client.put(url, json=data, timeout=30)
                     response.raise_for_status()
                     return response.json() if response.text else {}
