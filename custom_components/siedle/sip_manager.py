@@ -142,7 +142,11 @@ class SipCall:
     invite_cseq: int = 1
     local_from: Optional[str] = None
     auth_attempted: bool = False
-    
+    # Incoming calls (we are the UAS): set once a final response (2xx-6xx)
+    # went out for the INVITE, so it is never answered twice.
+    incoming: bool = False
+    final_response_sent: bool = False
+
     def next_cseq(self) -> int:
         """Get and increment CSeq."""
         current = self.cseq
@@ -246,6 +250,7 @@ class SipConnection:
         # Keepalive / re-registration
         self._last_recv_time: float = 0.0
         self._last_register_time: float = 0.0
+        self._re_register_auth_sent = False
         self._connection_lost = False
         # Re-register interval: 300s (well before 3600s Expires)
         self.re_register_interval: int = 300
@@ -552,9 +557,11 @@ class SipConnection:
             self._dialog_to_tags[call_id] = uuid.uuid4().hex[:8]
         to_tag = self._dialog_to_tags[call_id]
 
-        # Build To header with tag for 200 OK
+        # RFC 3261 §8.2.6.2: every response except 100 Trying carries a To tag.
+        # Final error responses (486, 487, ...) without it are not matched to
+        # the INVITE by the Siedle proxy.
         to_header = request.to_header
-        if status_code == 200 and ";tag=" not in to_header:
+        if status_code > 100 and ";tag=" not in to_header:
             to_header = f"{to_header};tag={to_tag}"
         
         lines = [f"SIP/2.0 {status_code} {status_text}"]
@@ -624,7 +631,49 @@ class SipConnection:
         ]
         
         return "\r\n".join(lines).encode('utf-8')
-    
+
+    def create_bye_for_incoming(self, invite: SipMessage, cseq: int) -> bytes:
+        """Create a BYE for a call the remote side placed to us (we are UAS).
+
+        RFC 3261 §12.1.1 / §12.2.1.1: the remote target is the Contact of the
+        INVITE, the route set is its Record-Route list in the same order,
+        From is our side (the INVITE's To plus the tag of our 200 OK) and To
+        is the caller (the INVITE's From). create_bye() builds a BYE for calls
+        we placed; for an incoming call it produced a request the Siedle
+        proxy could not match, so the call stayed up on the Siedle side.
+        """
+        local_ip = self._get_local_ip()
+        branch = uuid.uuid4().hex[:12]
+        transport_str = self.config.transport_str
+
+        contact = invite.contact or invite.from_header or ""
+        m = re.search(r'<([^>]+)>', contact)
+        remote_target = m.group(1) if m else contact.split(";")[0].strip()
+
+        local_side = invite.to_header or ""
+        to_tag = self._dialog_to_tags.get(invite.call_id)
+        if to_tag and ";tag=" not in local_side:
+            local_side = f"{local_side};tag={to_tag}"
+
+        lines = [
+            f"BYE {remote_target} SIP/2.0",
+            f"Via: SIP/2.0/{transport_str} {local_ip}:{self._local_port};rport;branch=z9hG4bK-{branch}",
+            "Max-Forwards: 70",
+        ]
+        for rr in invite.record_route_list:
+            lines.append(f"Route: {rr}")
+        lines.extend([
+            f"From: {local_side}",
+            f"To: {invite.from_header}",
+            f"Call-ID: {invite.call_id}",
+            f"CSeq: {cseq} BYE",
+            "User-Agent: Siedle-HA/1.0",
+            "Content-Length: 0",
+            "",
+            "",
+        ])
+        return "\r\n".join(lines).encode('utf-8')
+
     def create_ack(self, call: SipCall, for_response: SipMessage) -> bytes:
         """Create SIP ACK message.
 
@@ -919,9 +968,16 @@ class SipConnection:
         if realm_match and nonce_match:
             self._realm = realm_match.group(1)
             self._nonce = nonce_match.group(1)
+            # Answer the challenge once per refresh. A second 401 means the
+            # credentials themselves are rejected; retrying would loop.
+            if self._re_register_auth_sent:
+                _LOGGER.warning(f"{self.name}: REGISTER rejected again after authentication ({msg.status_code})")
+                return
+            self._re_register_auth_sent = True
             _LOGGER.debug(f"{self.name}: Got new nonce from REGISTER {msg.status_code}, retrying re-REGISTER...")
             try:
-                self._send_re_register()
+                if self._socket and self._connected:
+                    self._socket.send(self._create_register(with_auth=True))
             except Exception as e:
                 _LOGGER.warning(f"{self.name}: Re-REGISTER retry failed: {e}")
         else:
@@ -989,8 +1045,12 @@ class SipConnection:
         """Send a re-REGISTER to refresh registration."""
         if not self._socket or not self._connected:
             return
-        # Send authenticated REGISTER (we already have realm/nonce from initial auth)
-        register_msg = self._create_register(with_auth=True)
+        # Start every refresh without credentials and answer the server's 401
+        # challenge with a fresh nonce (_handle_register_auth_challenge).
+        # Re-using the nonce of the previous registration makes the FRITZ!Box
+        # reject it and log "Anmeldung ... nicht erfolgreich" every time.
+        self._re_register_auth_sent = False
+        register_msg = self._create_register(with_auth=False)
         self._socket.send(register_msg)
         _LOGGER.debug(f"{self.name}: Re-REGISTER sent")
     
@@ -1103,6 +1163,10 @@ class SipCallManager:
         self._handled_call_ids: Dict[str, float] = {}
         # True while a call we placed ourselves (call_door) is in progress.
         self._door_call_outgoing = False
+        # hangup() on a ringing doorbell call answers it and sends BYE once
+        # the ACK is in (see hangup()).
+        self._hangup_after_ack = False
+        self._hangup_lock = threading.Lock()
         self._external_call: Optional[SipCall] = None
         
         # State
@@ -1487,8 +1551,9 @@ class SipCallManager:
                 remote_rtp_host=msg.get_sdp_connection_ip(),
                 remote_rtp_port=msg.get_sdp_media_port() or 0,
                 invite_data=msg.raw.encode('utf-8'),
+                incoming=True,
             )
-            
+
             self._set_state(CallState.RINGING_IN, data)
             
             # Reset sequential forwarding index
@@ -1514,11 +1579,13 @@ class SipCallManager:
             self._send_ok_response(self._siedle_conn, msg)
             
             # Also send 487 Request Terminated for the original INVITE
-            if self._siedle_call and self._siedle_call.invite_data:
+            if (self._siedle_call and self._siedle_call.invite_data
+                    and not self._siedle_call.final_response_sent):
                 try:
                     original = SipConnection.parse_message(self._siedle_call.invite_data)
                     response = self._siedle_conn.create_response(original, 487, "Request Terminated")
                     self._siedle_conn.send(response)
+                    self._siedle_call.final_response_sent = True
                     _LOGGER.info("487 Request Terminated sent to Siedle")
                 except Exception as e:
                     _LOGGER.warning(f"Failed to send 487: {e}")
@@ -1529,10 +1596,14 @@ class SipCallManager:
         elif msg.is_request and msg.method == "ACK":
             _LOGGER.info("Siedle: ACK received - call fully established, RTP should now flow")
             # ACK doesn't require a response
-        
+            if self._hangup_after_ack:
+                self._finish_answer_hangup()
+
         elif not msg.is_request:
             # Log all SIP responses (100, 180, 183, etc.)
             _LOGGER.debug(f"Siedle: SIP response {msg.status_code} {msg.status_text}")
+            if "BYE" in (msg.cseq or ""):
+                _LOGGER.info("Siedle: response to our BYE: %s %s", msg.status_code, msg.status_text)
 
             # Responses to a door call we placed ourselves (call_door service).
             if self._door_call_outgoing and self._siedle_call:
@@ -2157,8 +2228,9 @@ class SipCallManager:
                 self.rtp_bridge.send_nat_punch(post_remote, count=3)
             
             self._siedle_call.state = CallState.CONNECTED
+            self._siedle_call.final_response_sent = True
             self._siedle_call.local_rtp_port = local_rtp_port
-            
+
             # Start recording if enabled
             if self.recording_enabled and self.rtp_bridge and self.recording_path:
                 try:
@@ -2318,6 +2390,7 @@ class SipCallManager:
                 self.rtp_bridge.send_nat_punch(remote_siedle, count=3)
             
             self._siedle_call.state = CallState.CONNECTED
+            self._siedle_call.final_response_sent = True
             self._siedle_call.local_rtp_port = self.rtp_bridge.local_port_a
             
             # Start recording if enabled
@@ -2341,18 +2414,39 @@ class SipCallManager:
         # F1: Cancel forward timeout timer
         self._cancel_forward_timeout()
         
-        # Send BYE to Siedle (any active state, not just CONNECTED)
+        # End the Siedle side. Until the Siedle server gets a final answer
+        # (or a valid BYE) it keeps the door station's call open, and further
+        # doorbell presses during that time never reach us.
         if self._siedle_call and self._siedle_conn:
-            if self._siedle_call.state in (CallState.CONNECTED, CallState.RECORDING):
+            call = self._siedle_call
+            if call.state in (CallState.CONNECTED, CallState.RECORDING):
                 try:
-                    bye = self._siedle_conn.create_bye(self._siedle_call)
+                    if call.incoming and call.invite_data:
+                        invite = SipConnection.parse_message(call.invite_data)
+                        bye = self._siedle_conn.create_bye_for_incoming(invite, call.next_cseq())
+                    else:
+                        bye = self._siedle_conn.create_bye(call)
                     self._siedle_conn.send(bye)
                     _LOGGER.info("BYE sent to Siedle")
+                    _LOGGER.debug("BYE to Siedle:\n%s", bye.decode("utf-8", errors="replace"))
                 except Exception as e:
                     _LOGGER.warning(f"Failed to send BYE to Siedle: {e}")
-            elif self._siedle_call.state in (CallState.RINGING_IN, CallState.RINGING_OUT):
-                # Call not yet answered — send CANCEL instead of BYE
-                _LOGGER.info(f"Siedle call in {self._siedle_call.state.value} — not sending BYE (not connected)")
+            elif (call.incoming and call.state == CallState.RINGING_IN
+                    and not call.final_response_sent and call.invite_data):
+                # Doorbell call never answered: reject the INVITE. 486 ends
+                # only our branch; the door station is freed as soon as no
+                # other device of the Siedle account is still ringing.
+                try:
+                    invite = SipConnection.parse_message(call.invite_data)
+                    self._siedle_conn.send(
+                        self._siedle_conn.create_response(invite, 486, "Busy Here")
+                    )
+                    call.final_response_sent = True
+                    _LOGGER.info("486 Busy Here sent to Siedle (doorbell call ended unanswered)")
+                except Exception as e:
+                    _LOGGER.warning(f"Failed to reject Siedle INVITE: {e}")
+            elif call.state in (CallState.RINGING_IN, CallState.RINGING_OUT):
+                _LOGGER.info(f"Siedle call in {call.state.value} — not sending BYE (not connected)")
         
         # Send BYE to external (any active state)
         if self._external_call and self._external_conn:
@@ -2404,11 +2498,85 @@ class SipCallManager:
         _LOGGER.info("Call ended — state reset to IDLE, ready for next call")
     
     def hangup(self):
-        """Hangup active call (callable from HA)."""
-        if self.is_call_active:
-            self._end_call()
+        """Hangup active call (callable from HA).
+
+        A doorbell call that is still ringing is answered and then ended with
+        BYE once the ACK is in. Rejecting it (486) only ends our branch: the
+        Siedle server keeps ringing the account's other devices for about
+        45 s, and further doorbell presses during that time never reach us.
+        An answered call ends those other branches at once.
+        """
+        if not self.is_call_active:
+            return False
+        call = self._siedle_call
+        if (call and self._siedle_conn and call.incoming
+                and call.state == CallState.RINGING_IN
+                and not call.final_response_sent and not self._door_call_outgoing):
+            _LOGGER.info("Hangup while ringing: answering the doorbell call to end it on all devices")
+            self._cancel_forward_timeout()
+            self._cancel_external_invite()  # stop the forwarded phone ringing
+            with self._hangup_lock:
+                self._hangup_after_ack = True
+            if self._answer_siedle_call_to_end():
+                # RFC 3261 §15: BYE only after the ACK; fall back if it never comes.
+                threading.Timer(2.0, self._finish_answer_hangup).start()
+                return True
+            with self._hangup_lock:
+                self._hangup_after_ack = False
+        self._end_call()
+        return True
+
+    def _answer_siedle_call_to_end(self) -> bool:
+        """Send a 200 OK for the ringing doorbell INVITE, without any media.
+
+        Used only by hangup(): the call is ended with BYE right after the
+        ACK, so no RTP bridge is set up and the SDP answer is inactive.
+        """
+        call = self._siedle_call
+        if not call or not call.invite_data or not self._siedle_conn:
+            return False
+        try:
+            invite = SipConnection.parse_message(call.invite_data)
+            sdp_ip = self._siedle_conn.get_sdp_ip()
+            offer = invite.body or ""
+            crypto_attr = ""
+            media_proto = "RTP/AVP"
+            if "RTP/SAVP" in offer:
+                media_proto = "RTP/SAVP"
+                from .srtp_handler import SRTPCrypto
+                our_crypto_line, _ = SRTPCrypto.generate_sdp_crypto_line()
+                crypto_attr = f"a=crypto:{our_crypto_line}\r\n"
+            now = int(time.time())
+            sdp = (
+                f"v=0\r\n"
+                f"o=- {now} {now} IN IP4 {sdp_ip}\r\n"
+                f"s=Siedle HA\r\n"
+                f"c=IN IP4 {sdp_ip}\r\n"
+                f"t=0 0\r\n"
+                f"m=audio 9 {media_proto} 8 101\r\n"
+                f"a=rtpmap:8 PCMA/8000\r\n"
+                f"a=rtpmap:101 telephone-event/8000\r\n"
+                f"a=fmtp:101 0-16\r\n"
+                f"{crypto_attr}"
+                f"a=inactive\r\n"
+            )
+            self._siedle_conn.send(self._siedle_conn.create_response(invite, 200, "OK", sdp))
+            call.state = CallState.CONNECTED
+            call.final_response_sent = True
+            _LOGGER.info("200 OK sent to Siedle (answering only to end the call)")
             return True
-        return False
+        except Exception as e:
+            _LOGGER.warning(f"Could not answer doorbell call to end it: {e}")
+            return False
+
+    def _finish_answer_hangup(self):
+        """Send the BYE for a call that hangup() answered only to end it."""
+        with self._hangup_lock:
+            if not self._hangup_after_ack:
+                return
+            self._hangup_after_ack = False
+        _LOGGER.info("Ending the answered doorbell call (BYE)")
+        self._end_call()
     
     def start(self) -> bool:
         """Start SIP manager."""

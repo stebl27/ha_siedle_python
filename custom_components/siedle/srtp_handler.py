@@ -130,7 +130,8 @@ class SRTPCrypto:
         encryptor = cipher.encryptor()
         
         # Derive 16 bytes for encryption key, or 14 bytes for salt
-        key_len = 16 if label in (0x00, 0x01) else 14
+        # RFC 3711: n_e = 128 bit, n_a = 160 bit (HMAC-SHA1), n_s = 112 bit
+        key_len = {0x00: 16, 0x01: 20, 0x02: 14}[label]
         session_key = encryptor.update(b'\x00' * key_len)
         
         return session_key
@@ -176,15 +177,13 @@ class SRTPCrypto:
         state["last_seq"] = sequence
 
         iv = bytearray(16)
-        iv[0:14] = session_salt
-        iv[4:8] = header[8:12]  # SSRC
-        iv[14:16] = header[2:4]  # Sequence
-
-        roc = state["roc"]
-        if roc:
-            roc_bytes = struct.pack("!I", roc)
-            for i in range(4):
-                iv[10 + i] ^= roc_bytes[i]
+        iv[0:14] = session_salt          # k_s * 2^16 (bytes 14..15 stay 0 = block counter)
+        for i in range(4):               # XOR SSRC * 2^64 -> bytes 4..7
+            iv[4 + i] ^= header[8 + i]
+        index = (state["roc"] << 16) | sequence   # 48-bit packet index
+        index_bytes = index.to_bytes(6, "big")
+        for i in range(6):               # XOR i * 2^16 -> bytes 8..13
+            iv[8 + i] ^= index_bytes[i]
 
         return bytes(iv)
 
@@ -230,8 +229,11 @@ class SRTPCrypto:
             # Verify the HMAC. This used to be skipped entirely, which left
             # SRTP without any integrity protection — anyone able to reach the
             # RTP port could inject audio without knowing the key.
+            sequence = struct.unpack("!H", header[2:4])[0]
+            iv = self._build_iv(session_salt, header, ssrc, sequence)
+            roc = self._roc_state[ssrc]["roc"]
             expected_tag = hmac.new(
-                session_auth_key, srtp_packet, hashlib.sha1
+                session_auth_key, srtp_packet + struct.pack("!I", roc), hashlib.sha1
             ).digest()[:10]
             if hmac.compare_digest(expected_tag, auth_tag):
                 self._auth_verified_once = True
@@ -252,9 +254,6 @@ class SRTPCrypto:
 
             # Extract encrypted payload
             encrypted_payload = srtp_packet[header_len:]
-
-            sequence = struct.unpack("!H", header[2:4])[0]
-            iv = self._build_iv(session_salt, header, ssrc, sequence)
 
             # Decrypt using AES-CTR
             cipher = Cipher(
@@ -320,7 +319,10 @@ class SRTPCrypto:
             auth_portion = header + encrypted_payload
             
             # Compute HMAC-SHA1-80 authentication tag
-            auth_tag = hmac.new(session_auth_key, auth_portion, hashlib.sha1).digest()[:10]
+            roc = self._roc_state[ssrc]["roc"]
+            auth_tag = hmac.new(
+                session_auth_key, auth_portion + struct.pack("!I", roc), hashlib.sha1
+            ).digest()[:10]
             
             return auth_portion + auth_tag
             
