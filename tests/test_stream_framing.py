@@ -31,6 +31,13 @@ class ChunkSocket:
     def settimeout(self, timeout):
         pass
 
+    def gettimeout(self):
+        return None
+
+    def pending(self):
+        # Like SSLSocket.pending(): data is ready, so recv() skips select()
+        return 1 if self.chunks else 0
+
     def recv(self, size):
         if not self.chunks:
             raise socket.timeout()

@@ -1457,8 +1457,11 @@ class SipCallManager:
         
         self._cancel_forward_timeout()
         
-        @_call_locked
-        def _on_timeout(self=self):
+        def _on_timeout():
+            with self._call_lock:
+                _on_timeout_locked()
+
+        def _on_timeout_locked():
             _LOGGER.warning(f"Forward timeout ({self.forward_timeout}s) — external phone didn't answer")
             
             targets = self._get_forward_targets()
@@ -1485,9 +1488,7 @@ class SipCallManager:
                 else:
                     self._end_call()
         
-        # _on_timeout is wrapped by _call_locked, which takes self as its
-        # first argument; the Timer must pass it.
-        self._forward_timeout_timer = threading.Timer(self.forward_timeout, _on_timeout, args=(self,))
+        self._forward_timeout_timer = threading.Timer(self.forward_timeout, _on_timeout)
         self._forward_timeout_timer.daemon = True
         self._forward_timeout_timer.start()
         _LOGGER.info(f"Forward timeout started: {self.forward_timeout}s")
